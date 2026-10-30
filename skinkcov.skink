@@ -1,0 +1,223 @@
+// Copyright 2026 Mark Oxley. All rights reserved.
+//
+// Project: Skink — A self-hosted, statically-typed programming language
+//          targeting LLVM IR, designed for systems programming with
+//          modern ergonomics and a Go-inspired syntax.
+//
+// File:    tools/skinkcov/skinkcov.skink
+// Purpose: Coverage report tool for binaries built with `skink -cov`.
+//          Parses a .skinkcov file (covmap + hit counts written by
+//          cov_rt.c at program exit) and prints per-file line coverage,
+//          an optional per-function breakdown, and an LCOV report
+//          suitable for genhtml / editor coverage gutters.
+//
+//          .skinkcov file format (written by std/runtime/cov_rt.c):
+//            SKINKCOV1
+//            <map lines: file<TAB>line<TAB>col<TAB>fn>
+//            COUNTS
+//            <count lines, one per probe id>
+//
+//          Usage:
+//            skinkcov <prog.skinkcov> [-lcov out.info] [-v]
+//
+// Author:  Mark Oxley
+// Created: 2026
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+module main
+
+import "std/os"
+import "std/fs"
+import "std/io"
+import "std/str"
+import "std/strconv"
+import "std/sort"
+
+// fileAgg accumulates per-file coverage counters: the maximum hit count
+// seen per source line (several statements may share a line) and total
+// hits per function name (for the -v breakdown).
+struct fileAgg {
+    lines:  map[int]int      // line number -> max hit count
+    fnHits: map[string]int   // function name -> summed hits
+}
+
+// pct renders "NNN%" padded for the report.
+fn pctStr(nh: int, nl: int) -> string {
+    pct := 0
+    if nl > 0 {
+        pct = nh * 100 / nl
+    }
+    return strconv.Itoa(pct)
+}
+
+fn main() -> int {
+    args := os.Args()
+    covFile := ""
+    lcovOut := ""
+    verbose := false
+    i := 1
+    for i < len(args) {
+        a := args[i]
+        if a == "-lcov" && i + 1 < len(args) {
+            lcovOut = args[i + 1]
+            i = i + 2
+            continue
+        }
+        if a == "-v" {
+            verbose = true
+            i = i + 1
+            continue
+        }
+        covFile = a
+        i = i + 1
+    }
+    if str.Len(covFile) == 0 {
+        io.PrintLine("usage: skinkcov <prog.skinkcov> [-lcov out.info] [-v]")
+        return 1
+    }
+
+    data, rerr := fs.ReadAll(covFile)
+    if str.Len(rerr.message) > 0 {
+        io.PrintLine(str.Concat("cannot read ", covFile))
+        return 1
+    }
+
+    lines := str.Split(data, "\n")
+    if len(lines) == 0 || !str.Equal(lines[0], "SKINKCOV1") {
+        io.PrintLine("not a skinkcov file (missing SKINKCOV1 header)")
+        return 1
+    }
+
+    // Parse map lines until the COUNTS marker; each entry i pairs with
+    // count line i after the marker.
+    var eFile []string
+    var eLine []int
+    var eFn []string
+    idx := 1
+    for idx < len(lines) && !str.Equal(lines[idx], "COUNTS") {
+        l := lines[idx]
+        idx = idx + 1
+        if str.Len(l) == 0 {
+            continue
+        }
+        parts := str.Split(l, "\t")
+        if len(parts) < 4 {
+            continue
+        }
+        eFile = append(eFile, parts[0])
+        lv, _ := strconv.ParseInt(parts[1])
+        eLine = append(eLine, lv)
+        eFn = append(eFn, parts[3])
+    }
+    idx = idx + 1  // skip COUNTS
+
+    files := make(map[string]fileAgg)
+    e := 0
+    for e < len(eFile) && idx < len(lines) {
+        cnt := 0
+        cv, ok := strconv.ParseInt(lines[idx])
+        if ok {
+            cnt = cv
+        }
+        idx = idx + 1
+        file := eFile[e]
+        a, exists := files[file]
+        if !exists {
+            a = fileAgg{lines: make(map[int]int), fnHits: make(map[string]int)}
+        }
+        ln := eLine[e]
+        _, has := a.lines[ln]
+        if !has || cnt > a.lines[ln] {
+            a.lines[ln] = cnt
+        }
+        a.fnHits[eFn[e]] = a.fnHits[eFn[e]] + cnt
+        files[file] = a
+        e = e + 1
+    }
+
+    // Report per file (sorted), then TOTAL.
+    var order []string
+    for k := range files {
+        order = append(order, k)
+    }
+    sort.SortStrings(order)
+
+    lb := str.NewBuilder(4096)
+    totLines := 0
+    totHit := 0
+    for oi := 0; oi < len(order); oi = oi + 1 {
+        file := order[oi]
+        a := files[file]
+        var lns []int
+        for ln := range a.lines {
+            lns = append(lns, ln)
+        }
+        sort.SortInts(lns)
+        nl := len(lns)
+        nh := 0
+        for li := 0; li < nl; li = li + 1 {
+            if a.lines[lns[li]] > 0 {
+                nh = nh + 1
+            }
+        }
+        totLines = totLines + nl
+        totHit = totHit + nh
+        io.PrintLine(str.Concat(pctStr(nh, nl),
+            str.Concat("%  ", str.Concat(strconv.Itoa(nh),
+                str.Concat("/", str.Concat(strconv.Itoa(nl),
+                    str.Concat("  ", file)))))))
+
+        if verbose {
+            var fns []string
+            for fname := range a.fnHits {
+                fns = append(fns, fname)
+            }
+            sort.SortStrings(fns)
+            for fi := 0; fi < len(fns); fi = fi + 1 {
+                mark := "    "
+                if a.fnHits[fns[fi]] == 0 {
+                    mark = "MISS"
+                }
+                io.PrintLine(str.Concat("        ",
+                    str.Concat(mark, str.Concat(" ", fns[fi]))))
+            }
+        }
+
+        // LCOV record for this file.
+        lb.Write("TN:\n")
+        lb.Write(str.Concat("SF:", str.Concat(file, "\n")))
+        for li := 0; li < nl; li = li + 1 {
+            lb.Write(str.Concat("DA:",
+                str.Concat(strconv.Itoa(lns[li]),
+                    str.Concat(",", str.Concat(strconv.Itoa(a.lines[lns[li]]), "\n")))))
+        }
+        lb.Write(str.Concat("LF:", str.Concat(strconv.Itoa(nl), "\n")))
+        lb.Write(str.Concat("LH:", str.Concat(strconv.Itoa(nh), "\n")))
+        lb.Write("end_of_record\n")
+    }
+
+    io.PrintLine(str.Concat(pctStr(totHit, totLines),
+        str.Concat("%  ", str.Concat(strconv.Itoa(totHit),
+            str.Concat("/", str.Concat(strconv.Itoa(totLines), "  TOTAL"))))))
+
+    if str.Len(lcovOut) > 0 {
+        werr := fs.WriteAll(lcovOut, str.BuilderValue(lb))
+        if str.Len(werr.message) > 0 {
+            io.PrintLine(str.Concat("cannot write ", lcovOut))
+            return 1
+        }
+        io.PrintLine(str.Concat("lcov written to ", lcovOut))
+    }
+    return 0
+}
